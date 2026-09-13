@@ -14,6 +14,11 @@ spec.loader.exec_module(ac)
 
 
 class TestHermesActivity(unittest.TestCase):
+    def test_process_home_reads_real_nul_delimiters(self):
+        handle = mock.mock_open(read_data=b"HOME=/tmp" + b"\0" + b"HERMES_HOME=/tmp/hermes" + b"\0")
+        with mock.patch("builtins.open", handle):
+            self.assertEqual(ac.get_process_hermes_home(123), "/tmp/hermes")
+
     def test_profile_db_is_selected_for_concurrent_process(self):
         with mock.patch.object(ac.os.path, "exists", return_value=True):
             rows = ac.get_all_hermes_dbs("/tmp/hermes", "fable")
@@ -47,6 +52,15 @@ class TestHermesActivity(unittest.TestCase):
         self.assertIn('var unknownCount = 0', text)
         self.assertIn('unknownCount++', text)
         self.assertIn('unknown agents', text)
+
+    def test_profile_flag_forms_are_parsed(self):
+        for argv in (["hermes", "--profile", "fable"], ["hermes", "--profile=fable"], ["hermes", "-p", "fable"], ["hermes", "-pfable"]):
+            self.assertEqual(ac.hermes_profile_from_argv(argv), "fable")
+
+    def test_herdr_status_mapping_preserves_unknown_and_blocked_attention(self):
+        self.assertEqual(ac.normalize_herdr_status("blocked"), "waiting")
+        self.assertEqual(ac.normalize_herdr_status("unknown"), "unknown")
+        self.assertEqual(ac.normalize_herdr_status("new_status"), "unknown")
 
     def test_hermes_tui_label_and_screen_status_are_normalized(self):
         self.assertEqual(ac.normalize_hermes_agent("hermes tui"), "hermes")

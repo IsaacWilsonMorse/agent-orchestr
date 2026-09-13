@@ -23,6 +23,7 @@ function statusBadgeText(status) {
   if (s === "working") return "ACTIVE"
   if (s === "waiting") return "PROMPT"
   if (s === "error") return "ERROR"
+  if (s === "unknown") return "UNKNOWN"
   return "IDLE"
 }
 
@@ -186,12 +187,14 @@ function getTooltipText(summary) {
   var completed = Number(summary.completed) || 0
   var idle = Number(summary.idle) || 0
   var waiting = Number(summary.waiting) || 0
+  var unknown = Number(summary.unknown) || 0
 
   if (total === 0) return "Agent Orchestrator: No active agents"
   var parts = []
   if (working > 0) parts.push(working + " working")
   if (waiting > 0) parts.push(waiting + " awaiting input")
   if (completed > 0) parts.push(completed + " completed")
+  if (unknown > 0) parts.push(unknown + " unknown")
   if (idle > 0) parts.push(idle + " idle")
   return "Agent Orchestrator · " + parts.join(", ") + " (" + total + " total)"
 }
