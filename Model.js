@@ -41,8 +41,10 @@ function originBadgeText(origin) {
   if (o === "herdr_remote") return "HERDR · REMOTE"
   if (o === "herdr_desktop") return "HERDR · GUI"
   if (o === "desktop") return "DESKTOP APP"
+  if (o === "process") return "HERMES CLI"
   if (o === "terminal") return "TERMINAL"
-  return "HERDR"
+  if (o === "herdr") return "HERDR"
+  return String(origin || "AGENT").toUpperCase()
 }
 
 function originIcon(origin) {
@@ -68,6 +70,8 @@ function originSummaryText(agents) {
   var herdrCount = 0
   var terminalCount = 0
   var desktopCount = 0
+  var cliCount = 0
+  var unknownCount = 0
   var orcaCount = 0
 
   for (var i = 0; i < list.length; i++) {
@@ -81,8 +85,12 @@ function originSummaryText(agents) {
       terminalCount++
     } else if (o === "herdr_remote") {
       herdrCount++
-    } else {
+    } else if (o === "process") {
+      cliCount++
+    } else if (o === "herdr" || o === "herdr_desktop") {
       herdrCount++
+    } else {
+      unknownCount++
     }
   }
 
@@ -92,6 +100,12 @@ function originSummaryText(agents) {
   }
   if (terminalCount > 0) {
     parts.push(terminalCount + (terminalCount === 1 ? " on terminal" : " on terminals"))
+  }
+  if (cliCount > 0) {
+    parts.push(cliCount + (cliCount === 1 ? " Hermes CLI" : " Hermes CLI instances"))
+  }
+  if (unknownCount > 0) {
+    parts.push(unknownCount + (unknownCount === 1 ? " unknown" : " unknown agents"))
   }
   if (orcaCount > 0) {
     parts.push(orcaCount + (orcaCount === 1 ? " on Orca" : " on Orca"))

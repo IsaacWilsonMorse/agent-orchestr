@@ -2533,6 +2533,10 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
 
             # Hermes CLI servers are local instance roots. They have no Hyprland
             # window, so keep them as process cards instead of dropping them.
+            is_hermes_desktop_child = any(
+                "/Hermes" in a["cmd"] and "--type=" not in a["cmd"]
+                for a in ancestors
+            )
 
             # Check if this is a Hermes Desktop GUI process
             if "/Hermes" in cmd and "--type=" not in cmd:
@@ -2582,17 +2586,17 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                 standalone.append({
                     "pane_id": f"process:hermes:{pid}",
                     "pid": pid,
-                    "origin": "process",
-                    "origin_label": "Hermes CLI",
+                    "origin": "desktop" if is_hermes_desktop_child else "process",
+                    "origin_label": "Hermes Desktop" if is_hermes_desktop_child else "Hermes CLI",
                     "agent": "hermes",
-                    "agent_display": "Hermes CLI",
+                    "agent_display": "Hermes Desktop" if is_hermes_desktop_child else "Hermes CLI",
                     "status": process_status,
                     "title": goal or f"Hermes {profile}",
                     "detail": detail or "Hermes server",
                     "cwd": shorten_path(info.get("cwd", "")),
                     "repo": "",
                     "workspace": "Local process",
-                    "tab": f"Hermes CLI (PID {pid})",
+                    "tab": f"{'Hermes Desktop' if is_hermes_desktop_child else 'Hermes CLI'} (PID {pid})",
                     "pane_label": f"Profile: {profile}",
                     "focused": False,
                     "model": "",

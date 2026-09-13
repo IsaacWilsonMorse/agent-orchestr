@@ -23,6 +23,31 @@ class TestHermesActivity(unittest.TestCase):
         with mock.patch.object(ac.os.path, "exists", side_effect=lambda path: path.endswith("/state.db") and "missing" not in path):
             self.assertEqual(ac.get_all_hermes_dbs("/tmp/hermes", "missing"), [])
 
+    def test_desktop_child_server_is_labeled_desktop_not_herdr(self):
+        processes = {
+            200: {"pid": 200, "ppid": 1, "cmd": "/opt/Hermes --disable-setuid-sandbox", "argv": ["/opt/Hermes"], "cwd": "/tmp", "state": "S"},
+            201: {"pid": 201, "ppid": 200, "cmd": "python -m hermes_cli.main --profile fable serve --host 127.0.0.1", "argv": ["python", "-m", "hermes_cli.main", "--profile", "fable", "serve", "--host", "127.0.0.1"], "cwd": "/tmp", "state": "S"},
+        }
+        with mock.patch.object(ac.glob, "glob", return_value=["/proc/201"]), \
+             mock.patch.object(ac, "get_process_info", return_value=processes[201]), \
+             mock.patch.object(ac, "get_process_ancestors", return_value=[processes[200]]), \
+             mock.patch.object(ac, "get_process_hermes_home", return_value="/tmp/hermes"), \
+             mock.patch.object(ac, "get_process_start_time", return_value=0), \
+             mock.patch.object(ac, "extract_hermes_session_info", return_value=(None, None, None, None, "Ready", "idle", False)):
+            rows = ac.scan_standalone_agents([], set(), set())
+        self.assertEqual(rows[0]["origin"], "desktop")
+        self.assertEqual(rows[0]["origin_label"], "Hermes Desktop")
+        self.assertEqual(rows[0]["agent_display"], "Hermes Desktop")
+        self.assertEqual(rows[0]["tab"], "Hermes Desktop (PID 201)")
+
+    def test_unknown_origin_is_not_herdr_summary_category(self):
+        model = os.path.join(ROOT, "Model.js")
+        with open(model, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn('var unknownCount = 0', text)
+        self.assertIn('unknownCount++', text)
+        self.assertIn('unknown agents', text)
+
     def test_hermes_tui_label_and_screen_status_are_normalized(self):
         self.assertEqual(ac.normalize_hermes_agent("hermes tui"), "hermes")
         self.assertEqual(ac.hermes_screen_status("\u23f3 Running tool: terminal"), "working")
