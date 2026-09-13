@@ -96,7 +96,7 @@ def remote_herdr_command(machine: Dict[str, str], operation: str = "api snapshot
         raise ValueError("invalid saved Herdr SSH target")
     if operation not in {"api snapshot"} and not re.fullmatch(r"agent read [A-Za-z0-9_.:-]+ --source detection", operation):
         raise ValueError("invalid saved Herdr operation")
-    remote = f'exec "$(command -v herdr || printf %s "$HOME/.local/bin/herdr")" --session {session} {operation}'
+    remote = f'exec "$(command -v herdr || for p in "$HOME/.local/bin/herdr" "$HOME/bin/herdr" /usr/local/bin/herdr /usr/bin/herdr; do [ -x "$p" ] && printf %s "$p" && break; done)" --session {session} {operation}'
     ssh_options = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=2"]
     if ssh_target[:1] == ["-p"]:
         ssh_options += ssh_target[:2]
