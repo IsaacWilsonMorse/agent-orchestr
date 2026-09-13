@@ -13,6 +13,8 @@ import json
 import os
 import re
 import signal
+from concurrent.futures import ThreadPoolExecutor
+
 import socket
 import sqlite3
 import stat
@@ -25,6 +27,125 @@ from urllib.parse import quote, unquote
 HERDR_SOCK_PATH = os.path.expanduser(os.environ.get("HERDR_SOCKET_PATH", "~/.config/herdr/herdr.sock"))
 OMP_SESSIONS_DIR = os.path.expanduser("~/.omp/agent/sessions")
 HERMES_STATE_DB = os.path.expanduser("~/.hermes/state.db")
+HERMES_CONNECTIONS_PATH = os.path.expanduser("~/.config/Hermes/connections.json")
+HERDR_MACHINE_TIMEOUT = 0.75
+HERDR_REMOTE_TIMEOUT = 2.5
+HERDR_REMOTE_MAX_BYTES = 262144
+
+
+def parse_herdr_machine_list(value: Any) -> List[Dict[str, str]]:
+    """Keep enabled saved Herdr machines, without auth or private config fields."""
+    if not isinstance(value, list):
+        return []
+    machines: List[Dict[str, str]] = []
+    for row in value[:64]:
+        if not isinstance(row, dict) or row.get("enabled") is False:
+            continue
+        machine_id = str(row.get("id") or "").strip()
+        target = str(row.get("target") or "").strip()
+        if not machine_id or not target:
+            continue
+        machines.append({
+            "id": machine_id,
+            "label": str(row.get("label") or target).strip()[:120],
+            "target": target,
+            "session": str(row.get("session") or "default").strip() or "default",
+        })
+    return machines
+
+
+def herdr_machine_list() -> List[Dict[str, str]]:
+    """Read saved machines through Herdr's existing local CLI."""
+    try:
+        proc = subprocess.run(
+            ["herdr", "machine", "list", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=HERDR_MACHINE_TIMEOUT,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return []
+        return parse_herdr_machine_list(json.loads(proc.stdout))
+    except Exception:
+        return []
+
+
+def remote_herdr_command(machine: Dict[str, str]) -> List[str]:
+    """Build SSH argv for Herdr's read-only API snapshot; reject unsafe identities."""
+    target = str(machine.get("target") or "")
+    session = str(machine.get("session") or "default")
+    if not target or not re.fullmatch(r"[A-Za-z0-9_.:@%+,-]+", target):
+        raise ValueError("invalid saved Herdr SSH target")
+    if not session or not re.fullmatch(r"[A-Za-z0-9_.-]+", session):
+        raise ValueError("invalid saved Herdr session")
+    # `api snapshot` is supported by installed remote Herdr clients. The newer
+    # bridge command is not present on older saved machines.
+    remote = f'exec "$HOME/.local/bin/herdr" --session {session} api snapshot'
+    return [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
+        "--", target, remote,
+    ]
+
+
+def remote_herdr_target_id(machine_id: str, session: str, pane_id: str) -> str:
+    """Build a collision-proof remote pane ID for UI routing."""
+    return f"herdr-remote:{machine_id}:{session}|{pane_id}"
+
+
+def query_remote_herdr_snapshot(machine: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """Query one saved machine through Herdr's read-only API command."""
+    try:
+        proc = subprocess.run(
+            remote_herdr_command(machine),
+            capture_output=True,
+            text=True,
+            timeout=HERDR_REMOTE_TIMEOUT,
+            check=False,
+        )
+        stdout = proc.stdout or ""
+        if proc.returncode != 0 or not stdout or len(stdout) > HERDR_REMOTE_MAX_BYTES:
+            return None
+        response = json.loads(stdout)
+        return response if isinstance(response, dict) else None
+    except Exception:
+        return None
+
+
+def read_hermes_registry() -> Dict[str, Any]:
+    """Read Desktop registry metadata only; missing or malformed data is empty."""
+    try:
+        with open(HERMES_CONNECTIONS_PATH, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def sanitize_hermes_registry_connections(registry: Any) -> List[Dict[str, str]]:
+    """Expose Desktop gateway labels only; never read or forward OAuth secrets."""
+    rows = registry.get("connections") if isinstance(registry, dict) else None
+    if not isinstance(rows, list):
+        return []
+    result: List[Dict[str, str]] = []
+    for row in rows[:64]:
+        if not isinstance(row, dict):
+            continue
+        identity = str(row.get("id") or "").strip()
+        label = str(row.get("label") or identity).strip()
+        kind = str(row.get("kind") or "").strip()
+        url = str(row.get("url") or "").strip()
+        auth_mode = str(row.get("authMode") or "").strip()
+        if not identity or not label or kind not in {"local", "remote", "cloud", "ssh"}:
+            continue
+        item = {"id": identity, "kind": kind, "label": label[:120]}
+        if url.startswith(("http://", "https://")):
+            item["url"] = url[:300]
+        if auth_mode:
+            item["auth_mode"] = auth_mode[:32]
+        result.append(item)
+    return result
+
 
 # Claude Code keeps no session .jsonl file descriptor open the way OMP does and
 # exposes no local session API the way Hermes does, so find_session_for_process()
@@ -238,11 +359,24 @@ def is_hermes_cli_process(cmd: str) -> bool:
       - hermes desktop wrapper (Electron app launcher)
       - /path/hermes-agent/hermes script (standalone CLI via bash wrapper)
     """
+    if "mcp_death_supervisor.py" in cmd:
+        return False
     return (
         "hermes_cli.main" in cmd
-        or "hermes desktop" in cmd
-        or "/hermes" in cmd
+        or re.search(r"(?:^|\s)[^\s]*/hermes(?:\s+desktop)?(?:\s|$)", cmd) is not None
+        or re.search(r"(?:^|\s)hermes(?:\s+desktop)?(?:\s|$)", cmd) is not None
     )
+
+
+def hermes_profile_from_argv(argv: Optional[List[str]]) -> Optional[str]:
+    """Return explicit Hermes profile from one process argv, if present."""
+    args = list(argv or [])
+    for index, value in enumerate(args):
+        if value == "--profile" and index + 1 < len(args):
+            return args[index + 1].strip() or None
+        if value.startswith("--profile="):
+            return value.split("=", 1)[1].strip() or None
+    return None
 
 
 # Claude Code runs internal helpers under the same `claude` binary (argv[0]).
@@ -1234,6 +1368,19 @@ def get_process_start_time(pid: int) -> float:
         return 0.0
 
 
+def get_process_hermes_home(pid: int) -> Optional[str]:
+    """Read non-secret HERMES_HOME marker for one local process."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as ef:
+            for item in ef.read(64 * 1024).split(b"\\x00"):
+                if item.startswith(b"HERMES_HOME="):
+                    value = item.split(b"=", 1)[1].decode("utf-8", errors="replace").strip()
+                    return os.path.realpath(os.path.expanduser(value)) if value else None
+    except Exception:
+        pass
+    return None
+
+
 def get_process_open_session(pid: int) -> Optional[str]:
     """Inspect open file descriptors of a process for active session files."""
     try:
@@ -1647,13 +1794,16 @@ def extract_omp_task_from_session(
         return None, None, None, None, False
 
 
-def get_all_hermes_dbs() -> List[Tuple[str, str]]:
-    """Discover default and profile-specific Hermes SQLite databases."""
+def get_all_hermes_dbs(hermes_home: Optional[str] = None) -> List[Tuple[str, str]]:
+    """Discover databases for one Hermes home, or all local homes by default."""
+    root = os.path.realpath(os.path.expanduser(hermes_home)) if hermes_home else os.path.expanduser("~/.hermes")
     dbs = []
-    base_db = os.path.expanduser("~/.hermes/state.db")
+    base_db = os.path.join(root, "state.db")
     if os.path.exists(base_db):
-        dbs.append((base_db, "Default"))
-    for p in glob.glob(os.path.expanduser("~/.hermes/profiles/*/state.db")):
+        dbs.append((base_db, os.path.basename(root) or "Default"))
+    if hermes_home:
+        return dbs
+    for p in glob.glob(os.path.join(root, "profiles", "*/state.db")):
         profile_name = os.path.basename(os.path.dirname(p))
         dbs.append((p, profile_name))
     return dbs
@@ -1663,6 +1813,7 @@ def extract_hermes_session_info(
     source_preference: Optional[str] = None,
     specific_session_id: Optional[str] = None,
     min_start_time: Optional[float] = None,
+    hermes_home: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], bool]:
     """Extract prompt, model, provider, profile, message detail, and active status for Hermes.
 
@@ -1670,7 +1821,7 @@ def extract_hermes_session_info(
     message stream state to accurately determine working, waiting, or idle status.
     """
     now = time.time()
-    all_dbs = get_all_hermes_dbs()
+    all_dbs = get_all_hermes_dbs(hermes_home)
     if not all_dbs:
         return None, None, None, None, None, None, False
 
@@ -2266,7 +2417,6 @@ def scan_orca_agents(claimed_sessions: Set[str]) -> List[Dict[str, Any]]:
 def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], claimed_sessions: Set[str]) -> List[Dict[str, Any]]:
     """Discover AI agents running in normal terminal windows outside of Herdr."""
     standalone = []
-    hermes_desktop_found = False
 
     for p in glob.glob("/proc/[0-9]*"):
         try:
@@ -2286,16 +2436,20 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
             )
 
             # Skip anything running inside Herdr, spawned as an internal background worker, or system usage script
-            if is_in_herdr or is_broker_child or is_claude_helper_process(cmd, info.get("argv")) or is_grok_helper_process(cmd, info.get("argv")) or "omarchy-agent-usage" in cmd or "__omp_worker" in cmd or "gateway run" in cmd or "serve --host" in cmd or "zygote" in cmd or "agent_ctl.py" in cmd:
+            if is_in_herdr or is_broker_child or is_claude_helper_process(cmd, info.get("argv")) or is_grok_helper_process(cmd, info.get("argv")) or "omarchy-agent-usage" in cmd or "__omp_worker" in cmd or "gateway run" in cmd or "zygote" in cmd or "agent_ctl.py" in cmd:
                 continue
 
+            # Hermes CLI servers are local instance roots. They have no Hyprland
+            # window, so keep them as process cards instead of dropping them.
+
             # Check if this is a Hermes Desktop GUI process
-            if "/Hermes" in cmd and "--type=" not in cmd and not hermes_desktop_found:
-                hermes_desktop_found = True
+            if "/Hermes" in cmd and "--type=" not in cmd:
                 if "hermes_desktop" in seen_cwds or is_in_herdr:
                     continue
 
-                hermes_title, hermes_model, hermes_provider, hermes_profile, hermes_detail, hermes_status, hermes_has_q = extract_hermes_session_info(source_preference="desktop")
+                hermes_title, hermes_model, hermes_provider, hermes_profile, hermes_detail, hermes_status, hermes_has_q = extract_hermes_session_info(
+                    source_preference="desktop", hermes_home=get_process_hermes_home(pid)
+                )
                 standalone.append({
                     "pane_id": f"desktop:hermes:{pid}",
                     "pid": pid,
@@ -2320,6 +2474,34 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
 
             tokens = cmd.split()
             first = os.path.basename(tokens[0])
+
+            # A Hermes `serve` process is an independent local instance but has
+            # no terminal window. Keep one card per PID/profile.
+            if first in ("python", "python3") and is_hermes_cli_process(cmd) and "serve --host" in cmd:
+                profile = hermes_profile_from_argv(info.get("argv")) or "Default"
+                standalone.append({
+                    "pane_id": f"process:hermes:{pid}",
+                    "pid": pid,
+                    "origin": "process",
+                    "origin_label": "Hermes CLI",
+                    "agent": "hermes",
+                    "agent_display": "Hermes CLI",
+                    "status": "working" if info.get("state") in ("R", "D") else "idle",
+                    "title": f"Hermes {profile}",
+                    "detail": "Hermes server",
+                    "cwd": shorten_path(info.get("cwd", "")),
+                    "repo": "",
+                    "workspace": "Local process",
+                    "tab": f"Hermes CLI (PID {pid})",
+                    "pane_label": f"Profile: {profile}",
+                    "focused": False,
+                    "model": "",
+                    "session_path": "",
+                    "has_question": False,
+                    "can_focus": False,
+                    "can_control": False,
+                })
+                continue
 
             agent_type = None
             if first in ("omp", "pi"):
@@ -2403,7 +2585,9 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                         user_goal, detail_text, model_name, status_override, has_question = extract_grok_task_from_session(session_path)
                     elif agent_type == "hermes":
                         p_st = get_process_start_time(pid)
-                        user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli", min_start_time=p_st)
+                        user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(
+                            source_preference="cli", min_start_time=p_st, hermes_home=get_process_hermes_home(pid)
+                        )
                 else:
                     if agent_type == "omp":
                         model_name = get_omp_default_model()
@@ -2467,7 +2651,12 @@ def fetch_all_agents() -> Dict[str, Any]:
     herdr_connected = False
     all_workspaces: List[str] = []
 
-    def consume_herdr_snapshot(snap: Dict[str, Any], sess_name: str, sess_sock: str) -> None:
+    def consume_herdr_snapshot(
+        snap: Dict[str, Any],
+        sess_name: str,
+        sess_sock: str,
+        remote_machine: Optional[Dict[str, str]] = None,
+    ) -> None:
         """Parse one Herdr session snapshot and merge its agents into the results.
 
         Each Herdr session is an independent server with its own socket and
@@ -2526,7 +2715,10 @@ def fetch_all_agents() -> Dict[str, Any]:
             agent_session = a.get("agent_session", {})
             session_path = agent_session.get("value") if isinstance(agent_session, dict) else None
 
-            if not session_path or not os.path.exists(session_path):
+            if remote_machine:
+                # Remote paths are not local paths. Never read them or select a local transcript.
+                session_path = None
+            elif not session_path or not os.path.exists(session_path):
                 session_path = find_latest_session_for_cwd(agent_type, cwd, claimed_sessions)
 
             if session_path:
@@ -2542,7 +2734,7 @@ def fetch_all_agents() -> Dict[str, Any]:
                 user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
             elif agent_type == "grok" and session_path:
                 user_goal, detail_text, model_name, status_override, has_question = extract_grok_task_from_session(session_path)
-            elif agent_type == "hermes":
+            elif agent_type == "hermes" and not remote_machine:
                 hermes_p_start = None
                 for hp in glob.glob("/proc/[0-9]*"):
                     try:
@@ -2594,8 +2786,12 @@ def fetch_all_agents() -> Dict[str, Any]:
                 # session tail, which distinguishes a finished task from a fresh prompt.
                 status = status_override or "idle"
 
-            origin = "herdr_desktop" if is_hermes_desktop else "herdr"
-            origin_label = "Herdr (Desktop)" if is_hermes_desktop else "Herdr"
+            origin = "herdr_remote" if remote_machine else ("herdr_desktop" if is_hermes_desktop else "herdr")
+            origin_label = (
+                f"Herdr · {remote_machine['label']}"
+                if remote_machine
+                else ("Herdr (Desktop)" if is_hermes_desktop else "Herdr")
+            )
             display_name = "Hermes Desktop" if is_hermes_desktop else (agent_type.upper() if agent_type in ("omp", "pi") else agent_type.capitalize())
 
             if status == "working":
@@ -2616,7 +2812,11 @@ def fetch_all_agents() -> Dict[str, Any]:
 
             agents_list.append(
                 {
-                    "pane_id": f"herdr:{sess_name}|{pane_id}",
+                    "pane_id": (
+                        remote_herdr_target_id(remote_machine["id"], sess_name, str(pane_id))
+                        if remote_machine
+                        else f"herdr:{sess_name}|{pane_id}"
+                    ),
                     "raw_pane_id": pane_id,
                     "herdr_session": sess_name,
                     "origin": origin,
@@ -2635,6 +2835,8 @@ def fetch_all_agents() -> Dict[str, Any]:
                     "model": model_name or (get_omp_default_model() if agent_type == "omp" else ""),
                     "session_path": session_path or "",
                     "has_question": has_question,
+                    "can_focus": not bool(remote_machine),
+                    "can_control": not bool(remote_machine),
                 }
             )
 
@@ -2643,6 +2845,29 @@ def fetch_all_agents() -> Dict[str, Any]:
         if resp and "result" in resp and "snapshot" in resp["result"]:
             herdr_connected = True
             consume_herdr_snapshot(resp["result"]["snapshot"], sess_name, sess_sock)
+
+    remote_machines = herdr_machine_list()
+    # ponytail: eight concurrent SSH probes; add persistent async transports only
+    # if fleet size makes one-shot polling measurably slow.
+    with ThreadPoolExecutor(max_workers=min(8, len(remote_machines) or 1)) as pool:
+        remote_results = list(pool.map(
+            lambda machine: (machine, query_remote_herdr_snapshot(machine)),
+            remote_machines,
+        ))
+
+    remote_machine_status = []
+    for machine, response in remote_results:
+        snapshot = response.get("result", {}).get("snapshot") if isinstance(response, dict) else None
+        reachable = isinstance(snapshot, dict)
+        remote_machine_status.append({
+            "id": machine["id"],
+            "label": machine["label"],
+            "session": machine["session"],
+            "reachable": reachable,
+        })
+        if reachable:
+            herdr_connected = True
+            consume_herdr_snapshot(snapshot, machine["session"], "", machine)
 
     # Orca-managed terminals run before the standalone process scan so they
     # can claim transcript sessions first; the standalone scan skips anything
@@ -2718,6 +2943,8 @@ def fetch_all_agents() -> Dict[str, Any]:
         "ok": True,
         "connected": herdr_connected,
         "herdr_sessions": [{"name": n, "socket": s} for n, s in herdr_session_sockets()],
+        "herdr_remote_machines": remote_machine_status,
+        "hermes_gateways": sanitize_hermes_registry_connections(read_hermes_registry()),
         "orca_connected": bool(query_orca_terminals()),
         "summary": {
             "total": total,
@@ -3034,6 +3261,8 @@ def dump_status_json(data: Dict[str, Any]) -> str:
         "ok": bool(payload.get("ok", True)),
         "connected": bool(payload.get("connected", False)),
         "herdr_sessions": [],
+        "herdr_remote_machines": [],
+        "hermes_gateways": [],
         "orca_connected": bool(payload.get("orca_connected", False)),
         "summary": counts,
         "agents": [],

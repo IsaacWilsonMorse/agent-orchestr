@@ -29,6 +29,7 @@ function statusBadgeText(status) {
 function originColor(origin) {
   var o = String(origin || "").toLowerCase()
   if (o === "orca") return "#22D3EE"
+  if (o === "herdr_remote") return "#F97316"
   if (o.indexOf("desktop") >= 0) return "#F59E0B"
   if (o === "terminal") return "#38BDF8"
   return "#A855F7"
@@ -37,6 +38,7 @@ function originColor(origin) {
 function originBadgeText(origin) {
   var o = String(origin || "").toLowerCase()
   if (o === "orca") return "ORCA"
+  if (o === "herdr_remote") return "HERDR · REMOTE"
   if (o === "herdr_desktop") return "HERDR · GUI"
   if (o === "desktop") return "DESKTOP APP"
   if (o === "terminal") return "TERMINAL"
@@ -77,6 +79,8 @@ function originSummaryText(agents) {
       desktopCount++
     } else if (o === "terminal") {
       terminalCount++
+    } else if (o === "herdr_remote") {
+      herdrCount++
     } else {
       herdrCount++
     }
