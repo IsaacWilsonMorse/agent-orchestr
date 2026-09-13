@@ -49,13 +49,20 @@ class TestHermesRegistrySafety(unittest.TestCase):
 class TestRemoteSnapshotTransport(unittest.TestCase):
     def test_snapshot_uses_machine_and_session_identity(self):
         fake = json.dumps({"id": "x", "result": {"snapshot": {"workspaces": [], "tabs": [], "panes": [], "agents": []}}})
-        proc = mock.Mock(returncode=0, stdout=fake)
-        with mock.patch.object(ac.subprocess, "run", return_value=proc) as run:
+        with mock.patch.object(ac, "run_bounded_remote_command", return_value=fake) as run:
             result = ac.query_remote_herdr_snapshot({"id": "m1", "target": "dev", "session": "agents"})
         self.assertEqual(result["result"]["snapshot"]["agents"], [])
         args = run.call_args.args[0]
         self.assertEqual(args[:4], ["ssh", "-o", "BatchMode=yes", "-o"])
         self.assertEqual(args[-1], 'exec "$HOME/.local/bin/herdr" --session agents api snapshot')
+
+    def test_remote_agent_read_uses_bounded_detection_command(self):
+        with mock.patch.object(ac, "run_bounded_remote_command", return_value="Ready for prompt") as run:
+            self.assertEqual(
+                ac.query_remote_herdr_agent_read({"target": "dev", "session": "agents"}, "w1:p1"),
+                "Ready for prompt",
+            )
+        self.assertIn("agent read w1:p1 --source detection", run.call_args.args[0][-1])
 
 
 if __name__ == "__main__":

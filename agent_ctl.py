@@ -13,6 +13,7 @@ import json
 import os
 import re
 import signal
+import selectors
 from concurrent.futures import ThreadPoolExecutor
 
 import socket
@@ -93,23 +94,97 @@ def remote_herdr_target_id(machine_id: str, session: str, pane_id: str) -> str:
     return f"herdr-remote:{machine_id}:{session}|{pane_id}"
 
 
+def run_bounded_remote_command(command: List[str]) -> Optional[str]:
+    """Run read-only SSH command with timeout and pre-decode output ceiling."""
+    proc = None
+    selector = selectors.DefaultSelector()
+    try:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        assert proc.stdout is not None
+        os.set_blocking(proc.stdout.fileno(), False)
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        chunks: List[bytes] = []
+        total = 0
+        deadline = time.monotonic() + HERDR_REMOTE_TIMEOUT
+        while time.monotonic() < deadline:
+            events = selector.select(max(0.0, deadline - time.monotonic()))
+            if not events:
+                break
+            try:
+                chunk = os.read(proc.stdout.fileno(), min(32768, HERDR_REMOTE_MAX_BYTES + 1 - total))
+            except BlockingIOError:
+                continue
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > HERDR_REMOTE_MAX_BYTES:
+                return None
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if proc.returncode != 0 or not chunks:
+            return None
+        return b"".join(chunks).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    finally:
+        selector.close()
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+
+
 def query_remote_herdr_snapshot(machine: Dict[str, str]) -> Optional[Dict[str, Any]]:
     """Query one saved machine through Herdr's read-only API command."""
     try:
-        proc = subprocess.run(
-            remote_herdr_command(machine),
-            capture_output=True,
-            text=True,
-            timeout=HERDR_REMOTE_TIMEOUT,
-            check=False,
-        )
-        stdout = proc.stdout or ""
-        if proc.returncode != 0 or not stdout or len(stdout) > HERDR_REMOTE_MAX_BYTES:
+        stdout = run_bounded_remote_command(remote_herdr_command(machine))
+        if stdout is None:
             return None
         response = json.loads(stdout)
         return response if isinstance(response, dict) else None
     except Exception:
         return None
+
+
+def query_herdr_pane_detection(pane_id: str, sock_path: str) -> Optional[str]:
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", str(pane_id or "")):
+        return None
+    response = query_herdr_socket(
+        "pane.read",
+        {"pane_id": pane_id, "source": "detection", "format": "text"},
+        sock_path=sock_path,
+    )
+    read = (response or {}).get("result", {}).get("read", {})
+    return read.get("text") if isinstance(read, dict) else None
+
+
+def query_remote_herdr_agent_read(machine: Dict[str, str], pane_id: str) -> Optional[str]:
+    """Read remote agent detection text without touching remote files."""
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", str(pane_id or "")):
+        return None
+    try:
+        command = remote_herdr_command(machine)
+        command[-1] = command[-1].replace(" api snapshot", f" agent read {pane_id} --source detection")
+        return run_bounded_remote_command(command)
+    except Exception:
+        return None
+
+
+def hermes_screen_status(text: Optional[str]) -> Optional[str]:
+    """Infer Hermes activity from screen text; stale agent labels are insufficient."""
+    value = str(text or "").lower()
+    if not value:
+        return None
+    if any(marker in value for marker in ("enter to confirm", "enter confirm", "hermes needs your", "dangerous command")):
+        return "waiting"
+    if any(marker in value for marker in ("⏳", "ctrl+c cancel", "ctrl+c to interrupt", "thinking…", "running tool")):
+        return "working"
+    if "✓" in value or "ready for prompt" in value:
+        return "idle"
+    return None
 
 
 def read_hermes_registry() -> Dict[str, Any]:
@@ -377,6 +452,12 @@ def hermes_profile_from_argv(argv: Optional[List[str]]) -> Optional[str]:
         if value.startswith("--profile="):
             return value.split("=", 1)[1].strip() or None
     return None
+
+
+def normalize_hermes_agent(value: Any) -> Optional[str]:
+    """Normalize Herdr labels such as ``hermes tui`` to one agent identity."""
+    label = str(value or "").strip().lower()
+    return "hermes" if label == "hermes" or label.startswith("hermes ") else None
 
 
 # Claude Code runs internal helpers under the same `claude` binary (argv[0]).
@@ -1794,9 +1875,14 @@ def extract_omp_task_from_session(
         return None, None, None, None, False
 
 
-def get_all_hermes_dbs(hermes_home: Optional[str] = None) -> List[Tuple[str, str]]:
-    """Discover databases for one Hermes home, or all local homes by default."""
+def get_all_hermes_dbs(hermes_home: Optional[str] = None, hermes_profile: Optional[str] = None) -> List[Tuple[str, str]]:
+    """Discover databases for one Hermes home/profile, or all local homes."""
     root = os.path.realpath(os.path.expanduser(hermes_home)) if hermes_home else os.path.expanduser("~/.hermes")
+    if hermes_profile:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", hermes_profile):
+            return []
+        profile_db = os.path.join(root, "profiles", hermes_profile, "state.db")
+        return [(profile_db, hermes_profile)] if os.path.exists(profile_db) else []
     dbs = []
     base_db = os.path.join(root, "state.db")
     if os.path.exists(base_db):
@@ -1814,6 +1900,7 @@ def extract_hermes_session_info(
     specific_session_id: Optional[str] = None,
     min_start_time: Optional[float] = None,
     hermes_home: Optional[str] = None,
+    hermes_profile: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], bool]:
     """Extract prompt, model, provider, profile, message detail, and active status for Hermes.
 
@@ -1821,7 +1908,7 @@ def extract_hermes_session_info(
     message stream state to accurately determine working, waiting, or idle status.
     """
     now = time.time()
-    all_dbs = get_all_hermes_dbs(hermes_home)
+    all_dbs = get_all_hermes_dbs(hermes_home, hermes_profile)
     if not all_dbs:
         return None, None, None, None, None, None, False
 
@@ -1852,6 +1939,11 @@ def extract_hermes_session_info(
                 cur.execute(
                     "SELECT id, source, title, model, billing_provider, profile_name, last_activity_at FROM sessions WHERE id = ? LIMIT 1;",
                     (specific_session_id,)
+                )
+            elif hermes_profile:
+                cur.execute(
+                    "SELECT id, source, title, model, billing_provider, profile_name, last_activity_at FROM sessions WHERE profile_name = ? ORDER BY last_activity_at DESC LIMIT 5;",
+                    (hermes_profile,),
                 )
             elif source_preference:
                 cur.execute(
@@ -2448,7 +2540,7 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                     continue
 
                 hermes_title, hermes_model, hermes_provider, hermes_profile, hermes_detail, hermes_status, hermes_has_q = extract_hermes_session_info(
-                    source_preference="desktop", hermes_home=get_process_hermes_home(pid)
+                    source_preference="desktop", hermes_home=get_process_hermes_home(pid), hermes_profile=hermes_profile_from_argv(info.get("argv"))
                 )
                 standalone.append({
                     "pane_id": f"desktop:hermes:{pid}",
@@ -2479,6 +2571,14 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
             # no terminal window. Keep one card per PID/profile.
             if first in ("python", "python3") and is_hermes_cli_process(cmd) and "serve --host" in cmd:
                 profile = hermes_profile_from_argv(info.get("argv")) or "Default"
+                hermes_home = get_process_hermes_home(pid)
+                goal, model, _provider, _db_profile, detail, detected_status, has_question = extract_hermes_session_info(
+                    source_preference=None,
+                    min_start_time=get_process_start_time(pid),
+                    hermes_home=hermes_home,
+                    hermes_profile=profile,
+                )
+                process_status = detected_status or ("working" if info.get("state") in ("R", "D") else "idle")
                 standalone.append({
                     "pane_id": f"process:hermes:{pid}",
                     "pid": pid,
@@ -2486,9 +2586,9 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                     "origin_label": "Hermes CLI",
                     "agent": "hermes",
                     "agent_display": "Hermes CLI",
-                    "status": "working" if info.get("state") in ("R", "D") else "idle",
-                    "title": f"Hermes {profile}",
-                    "detail": "Hermes server",
+                    "status": process_status,
+                    "title": goal or f"Hermes {profile}",
+                    "detail": detail or "Hermes server",
                     "cwd": shorten_path(info.get("cwd", "")),
                     "repo": "",
                     "workspace": "Local process",
@@ -2687,8 +2787,17 @@ def fetch_all_agents() -> Dict[str, Any]:
             pane_id = a.get("pane_id")
             pane_info = panes_map.get(pane_id, {})
 
-            agent_type = (a.get("agent") or "agent").lower()
+            raw_agent = (a.get("agent") or "agent").lower()
+            agent_type = normalize_hermes_agent(raw_agent) or raw_agent
             raw_status = (a.get("agent_status") or "idle").lower()
+            screen_status = None
+            if agent_type == "hermes":
+                screen_text = (
+                    query_remote_herdr_agent_read(remote_machine, str(pane_id))
+                    if remote_machine
+                    else query_herdr_pane_detection(str(pane_id), sess_sock)
+                )
+                screen_status = hermes_screen_status(screen_text)
 
             cwd = a.get("foreground_cwd") or a.get("cwd") or pane_info.get("foreground_cwd") or pane_info.get("cwd") or ""
             repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
@@ -2736,6 +2845,7 @@ def fetch_all_agents() -> Dict[str, Any]:
                 user_goal, detail_text, model_name, status_override, has_question = extract_grok_task_from_session(session_path)
             elif agent_type == "hermes" and not remote_machine:
                 hermes_p_start = None
+                hermes_profile = None
                 for hp in glob.glob("/proc/[0-9]*"):
                     try:
                         hpid = int(os.path.basename(hp))
@@ -2743,16 +2853,18 @@ def fetch_all_agents() -> Dict[str, Any]:
                         if hinfo and "hermes" in hinfo["cmd"].lower() and "gateway" not in hinfo["cmd"] and "zygote" not in hinfo["cmd"]:
                             if is_hermes_desktop and ("/Hermes" in hinfo["cmd"] or "hermes desktop" in hinfo["cmd"]):
                                 hermes_p_start = get_process_start_time(hpid)
+                                hermes_profile = hermes_profile_from_argv(hinfo.get("argv"))
                                 break
                             elif not is_hermes_desktop and is_hermes_cli_process(hinfo["cmd"]):
                                 hermes_p_start = get_process_start_time(hpid)
+                                hermes_profile = hermes_profile_from_argv(hinfo.get("argv"))
                                 break
                     except Exception:
                         pass
                 if is_hermes_desktop:
-                    user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="desktop", min_start_time=hermes_p_start)
+                    user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="desktop", min_start_time=hermes_p_start, hermes_profile=hermes_profile)
                 else:
-                    user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli", min_start_time=hermes_p_start)
+                    user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli", min_start_time=hermes_p_start, hermes_profile=hermes_profile)
             is_generic_title = cleaned_title in (repo_name, "~", "tmp", "/tmp", "") or cleaned_title.startswith("/tmp") or cleaned_title.startswith("alberto@")
 
             if user_goal:
@@ -2765,6 +2877,10 @@ def fetch_all_agents() -> Dict[str, Any]:
                 effective_title = f"Working in {repo_name}"
             else:
                 effective_title = f"{agent_type.upper()} session"
+            # Hermes screen evidence outranks stale detector state; Herdr's agent_status remains fallback.
+            if agent_type == "hermes" and screen_status:
+                status_override = screen_status
+
             # Determine effective status. Herdr's live agent_status is authoritative;
             # session-file inference only fills gaps and must NEVER downgrade a
             # live "working" report (a finished previous turn in the transcript tail
